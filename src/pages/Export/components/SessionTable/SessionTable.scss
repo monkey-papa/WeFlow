@@ -1,0 +1,290 @@
+.session-table-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg-surface, var(--bg-primary)); // Fallback
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 4px 20px color-mix(in srgb, var(--shadow-color) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+
+  // ── Top Filter (Search + Tabs inline) ──────────────────────────────────
+  .st-top-filter {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 64px;
+    flex-shrink: 0;
+    box-sizing: border-box;
+    padding: 0 24px;
+    background: var(--bg-surface, var(--bg-primary));
+    border-bottom: 1px solid color-mix(in srgb, var(--border-color) 40%, transparent);
+    gap: 24px;
+    -webkit-app-region: no-drag;
+
+    .st-tabs {
+      display: flex;
+      gap: 8px;
+
+      .tab-btn {
+        background: transparent;
+        border: none;
+        padding: 6px 16px;
+        color: var(--text-secondary);
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+        border-radius: 20px;
+        transition: all 0.2s ease;
+
+        &:hover {
+          background: var(--bg-hover, color-mix(in srgb, var(--primary) 10%, transparent));
+          color: var(--text-primary);
+        }
+
+        &.active {
+          background: var(--bg-active, color-mix(in srgb, var(--primary) 15%, transparent));
+          color: var(--primary);
+          font-weight: 600;
+        }
+      }
+    }
+
+    .st-search {
+      display: flex;
+      align-items: center;
+      background: var(--bg-main, var(--bg-secondary));
+      border-radius: 20px;
+      padding: 6px 14px;
+      width: 280px;
+      transition: all 0.2s ease;
+      border: 1px solid transparent;
+
+      &:focus-within {
+        border-color: var(--primary);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 20%, transparent);
+        background: var(--bg-surface, var(--bg-primary));
+      }
+
+      .search-icon {
+        color: var(--text-tertiary);
+        margin-right: 8px;
+        flex-shrink: 0;
+      }
+
+      input {
+        flex: 1;
+        border: none;
+        background: transparent;
+        outline: none;
+        color: var(--text-primary);
+        font-size: 13px;
+        min-width: 0;
+
+        &::placeholder {
+          color: var(--text-tertiary);
+        }
+      }
+
+      .clear-search-btn {
+        background: transparent;
+        border: none;
+        color: var(--text-tertiary);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2px;
+        border-radius: 50%;
+        margin-left: 4px;
+
+        &:hover {
+          color: var(--text-secondary);
+        }
+      }
+    }
+  }
+
+  // ── Grid Layout Definition ───────────────────────────────────────────
+  .st-header-row, .st-row {
+    display: grid;
+    grid-template-columns: 48px minmax(200px, 1fr) 80px 120px 60px 60px 60px 60px 60px 80px;
+    align-items: center;
+    gap: 8px;
+    padding: 0 24px;
+  }
+
+  // ── Header Row ──────────────────────────────────────────────────────────
+  .st-header-row {
+    height: 44px;
+    background: var(--bg-main, var(--bg-secondary));
+    border-bottom: 1px solid color-mix(in srgb, var(--border-color) 40%, transparent);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+
+    .col-checkbox {
+      justify-content: flex-start;
+    }
+
+    > div {
+      display: flex;
+      align-items: center;
+    }
+
+    .col-stat, .col-count {
+      justify-content: flex-end;
+      text-align: right;
+    }
+    
+    .col-action {
+      justify-content: center;
+    }
+  }
+
+  // ── List Body ───────────────────────────────────────────────────────────
+  .table-body {
+    flex: 1;
+    overflow: hidden; // virtuoso handles scrolling
+
+    .empty-state {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100px;
+      color: var(--text-tertiary);
+      font-size: 14px;
+    }
+  }
+
+  // ── Data Row ────────────────────────────────────────────────────────────
+  .st-row {
+    height: 64px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border-color) 20%, transparent);
+    transition: background 0.15s ease;
+    cursor: default;
+
+    &:hover {
+      background: var(--bg-hover, color-mix(in srgb, var(--text-primary) 3%, transparent));
+    }
+
+    > div {
+      display: flex;
+      align-items: center;
+      font-size: 13px;
+      color: var(--text-primary);
+    }
+
+    .col-stat, .col-count {
+      justify-content: flex-end;
+      font-family: 'Inter', system-ui, sans-serif;
+      color: var(--text-secondary);
+    }
+
+    .col-count {
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+
+    .col-time {
+      color: var(--text-tertiary);
+      font-size: 12px;
+    }
+
+    .col-action {
+      justify-content: center;
+      
+      .st-action-btn {
+        background: transparent;
+        border: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+        color: var(--text-secondary);
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+
+        &:hover {
+          background: var(--bg-hover);
+          color: var(--primary);
+          border-color: var(--primary);
+        }
+      }
+    }
+
+    // Avatar and info
+    .col-info {
+      gap: 12px;
+      overflow: hidden;
+
+      .st-avatar {
+        width: 40px;
+        height: 40px;
+        border-radius: 8px;
+        overflow: hidden;
+        flex-shrink: 0;
+        background: color-mix(in srgb, var(--primary) 10%, transparent);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+
+        img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
+
+        .avatar-letter {
+          font-size: 18px;
+          color: var(--primary);
+          font-weight: 600;
+        }
+      }
+
+      .st-text {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        overflow: hidden;
+        flex: 1;
+
+        .st-name {
+          font-size: 14px;
+          font-weight: 500;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+
+        .st-id {
+          font-size: 12px;
+          color: var(--text-tertiary);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          margin-top: 2px;
+        }
+      }
+    }
+  }
+
+  // ── Checkbox ──────────────────────────────────────────────────────────
+  .checkbox-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: var(--text-tertiary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+
+    &:hover {
+      color: var(--text-secondary);
+    }
+
+    .checked {
+      color: var(--primary);
+    }
+  }
+}

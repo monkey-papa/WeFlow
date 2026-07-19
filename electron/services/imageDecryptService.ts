@@ -303,7 +303,8 @@ export class ImageDecryptService {
     try {
       for (const md5 of normalizedList) {
         if (!this.looksLikeMd5(md5)) continue
-        const selectedPath = this.selectBestDatPathByBase(accountDir, md5, undefined, undefined, true)
+        const selectedPath = await this.resolveHardlinkPath(accountDir, md5) ||
+          this.selectBestDatPathByBase(accountDir, md5, undefined, undefined, true)
         if (!selectedPath) continue
         this.cacheDatPath(accountDir, md5, selectedPath)
         const fileName = basename(selectedPath).toLowerCase()
@@ -396,6 +397,14 @@ export class ImageDecryptService {
 
       if (!datPath) {
         this.logError('未找到DAT文件', undefined, { md5: payload.imageMd5, datName: payload.imageDatName })
+        console.warn('[ImageDecrypt] dat file not found', {
+          sessionId: payload.sessionId,
+          md5: payload.imageMd5,
+          datName: payload.imageDatName,
+          createTime: payload.createTime,
+          force: payload.force,
+          hardlinkOnly: payload.hardlinkOnly === true
+        })
         this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', '未找到DAT文件')
         if (usedHdAttempt) {
           return { success: false, error: '未找到图片文件，请在微信中点开该图片后重试', failureKind: 'not_found' }
@@ -458,6 +467,13 @@ export class ImageDecryptService {
       this.emitDecryptProgress(payload, cacheKey, 'decrypting', 58, 'running')
       const nativeResult = this.tryDecryptDatWithNative(datPath, xorKey, aesKeyForNative)
       if (!nativeResult) {
+        console.warn('[ImageDecrypt] native decrypt failed', {
+          sessionId: payload.sessionId,
+          md5: payload.imageMd5,
+          datName: payload.imageDatName,
+          datPath,
+          hasAesKey: Boolean(aesKeyForNative)
+        })
         this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', 'Rust原生解密不可用')
         return { success: false, error: 'Rust原生解密不可用或解密失败，请检查 native 模块与密钥配置', failureKind: 'not_found' }
       }
@@ -472,6 +488,14 @@ export class ImageDecryptService {
 
       // 如果解密产物无法识别为图片，归类为“解密失败”。
       if (!detectedExt) {
+        console.warn('[ImageDecrypt] decrypted data is not a supported image', {
+          sessionId: payload.sessionId,
+          md5: payload.imageMd5,
+          datName: payload.imageDatName,
+          datPath,
+          decryptedSize: decrypted.length,
+          isThumb: this.isThumbnailPath(datPath)
+        })
         this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', '解密后不是有效图片')
         return {
           success: false,
@@ -508,6 +532,13 @@ export class ImageDecryptService {
       return { success: true, localPath, isThumb }
     } catch (e) {
       this.logError('解密失败', e, { md5: payload.imageMd5, datName: payload.imageDatName })
+      console.warn('[ImageDecrypt] decrypt threw', {
+        sessionId: payload.sessionId,
+        md5: payload.imageMd5,
+        datName: payload.imageDatName,
+        createTime: payload.createTime,
+        error: e instanceof Error ? e.message : String(e)
+      })
       this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', String(e))
       return { success: false, error: String(e), failureKind: 'not_found' }
     }
@@ -602,6 +633,19 @@ export class ImageDecryptService {
 
     const lookupBases = this.collectLookupBasesForScan(imageMd5, imageDatName, allowDatNameScanFallback)
     if (lookupBases.length === 0) {
+      const selectedByName = this.resolveDatPathFromParsedDatName(accountDir, imageDatName, sessionId, createTime, allowThumbnail)
+      if (selectedByName) {
+        if (imageMd5) this.cacheDatPath(accountDir, imageMd5, selectedByName)
+        if (imageDatName) this.cacheDatPath(accountDir, imageDatName, selectedByName)
+        const normalizedFileName = basename(selectedByName).toLowerCase()
+        if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, selectedByName)
+        this.logInfo('[ImageDecrypt] datName selected without md5 base', {
+          imageDatName,
+          selectedPath: selectedByName,
+          allowThumbnail
+        })
+        return selectedByName
+      }
       this.logInfo('[ImageDecrypt] resolveDatPath miss (no lookup base)', { imageMd5, imageDatName })
       return null
     }
@@ -619,6 +663,39 @@ export class ImageDecryptService {
         if (!allowThumbnail && !this.isHdDatPath(cached)) continue
         return cached
       }
+    }
+
+    for (const baseMd5 of lookupBases) {
+      const hardlinkPath = await this.resolveHardlinkPath(accountDir, baseMd5, sessionId)
+      if (!hardlinkPath) continue
+      if (!allowThumbnail && !this.isHdDatPath(hardlinkPath)) continue
+
+      this.cacheDatPath(accountDir, baseMd5, hardlinkPath)
+      if (imageMd5) this.cacheDatPath(accountDir, imageMd5, hardlinkPath)
+      if (imageDatName) this.cacheDatPath(accountDir, imageDatName, hardlinkPath)
+      const normalizedFileName = basename(hardlinkPath).toLowerCase()
+      if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, hardlinkPath)
+      this.logInfo('[ImageDecrypt] hardlink selected', {
+        baseMd5,
+        selectedPath: hardlinkPath,
+        allowThumbnail,
+        hardlinkOnly
+      })
+      return hardlinkPath
+    }
+
+    const selectedByName = this.resolveDatPathFromParsedDatName(accountDir, imageDatName, sessionId, createTime, allowThumbnail)
+    if (selectedByName) {
+      if (imageMd5) this.cacheDatPath(accountDir, imageMd5, selectedByName)
+      if (imageDatName) this.cacheDatPath(accountDir, imageDatName, selectedByName)
+      const normalizedFileName = basename(selectedByName).toLowerCase()
+      if (normalizedFileName) this.cacheDatPath(accountDir, normalizedFileName, selectedByName)
+      this.logInfo('[ImageDecrypt] datName selected', {
+        imageDatName,
+        selectedPath: selectedByName,
+        allowThumbnail
+      })
+      return selectedByName
     }
 
     for (const baseMd5 of lookupBases) {
@@ -957,7 +1034,8 @@ export class ImageDecryptService {
     )
     if (thumbDatAny) return thumbDatAny
 
-    return null
+    const remaining = this.sortDatCandidatePaths(candidates, baseMd5)
+    return remaining[0] || null
   }
 
   private resolveDatPathFromParsedDatName(
@@ -970,19 +1048,52 @@ export class ImageDecryptService {
     const datNameRaw = String(imageDatName || '').trim().toLowerCase()
     if (!datNameRaw) return null
     const datNameNoExt = datNameRaw.endsWith('.dat') ? datNameRaw.slice(0, -4) : datNameRaw
-    const baseMd5 = this.normalizeDatBase(datNameNoExt)
-    if (!this.looksLikeMd5(baseMd5)) return null
+    const baseName = this.normalizeDatBase(datNameNoExt)
 
     const monthKey = this.resolveYearMonthFromCreateTime(createTime)
-    const missKey = `${accountDir}|scan|${String(sessionId || '').trim()}|${monthKey}|${baseMd5}|${allowThumbnail ? 'all' : 'hd'}`
+    const missKey = `${accountDir}|scan|${String(sessionId || '').trim()}|${monthKey}|${baseName}|${allowThumbnail ? 'all' : 'hd'}`
     const lastMiss = this.datNameScanMissAt.get(missKey) || 0
     if (lastMiss && (Date.now() - lastMiss) < this.datNameScanMissTtlMs) {
       return null
     }
 
-    const sessionMonthCandidates = this.collectDatCandidatesFromSessionMonth(accountDir, baseMd5, sessionId, createTime)
+    const exactNameCandidates = this.collectDatCandidatesFromSessionMonthByName(accountDir, datNameRaw, sessionId, createTime)
+    if (exactNameCandidates.length > 0) {
+      const orderedExact = this.sortDatCandidatePaths(exactNameCandidates, baseName)
+      for (const candidatePath of orderedExact) {
+        if (!allowThumbnail && !this.isHdDatPath(candidatePath)) continue
+        this.datNameScanMissAt.delete(missKey)
+        this.logInfo('[ImageDecrypt] datName fallback selected (exact session-month)', {
+          accountDir,
+          sessionId,
+          imageDatName: datNameRaw,
+          createTime,
+          monthKey,
+          baseName,
+          allowThumbnail,
+          selectedPath: candidatePath
+        })
+        return candidatePath
+      }
+    }
+
+    if (!this.looksLikeMd5(baseName)) {
+      this.datNameScanMissAt.set(missKey, Date.now())
+      this.logInfo('[ImageDecrypt] datName fallback precise scan miss (non-md5)', {
+        accountDir,
+        sessionId,
+        imageDatName: datNameRaw,
+        createTime,
+        monthKey,
+        baseName,
+        allowThumbnail
+      })
+      return null
+    }
+
+    const sessionMonthCandidates = this.collectDatCandidatesFromSessionMonth(accountDir, baseName, sessionId, createTime)
     if (sessionMonthCandidates.length > 0) {
-      const orderedSessionMonth = this.sortDatCandidatePaths(sessionMonthCandidates, baseMd5)
+      const orderedSessionMonth = this.sortDatCandidatePaths(sessionMonthCandidates, baseName)
       for (const candidatePath of orderedSessionMonth) {
         if (!allowThumbnail && !this.isHdDatPath(candidatePath)) continue
         this.datNameScanMissAt.delete(missKey)
@@ -992,7 +1103,7 @@ export class ImageDecryptService {
           imageDatName: datNameRaw,
           createTime,
           monthKey,
-          baseMd5,
+          baseName,
           allowThumbnail,
           selectedPath: candidatePath
         })
@@ -1008,7 +1119,7 @@ export class ImageDecryptService {
       imageDatName: datNameRaw,
       createTime,
       monthKey,
-      baseMd5,
+      baseName,
       allowThumbnail
     })
     return null
@@ -1039,10 +1150,7 @@ export class ImageDecryptService {
     if (!sessionDir) return []
     const candidates = new Set<string>()
     const budget = { remaining: 240 }
-    const targetDirs: Array<{ dir: string; depth: number }> = [
-      // 1) accountDir/msg/attach/{sessionMd5}/{yyyy-MM}/Img
-      { dir: join(accountDir, 'msg', 'attach', sessionDir, monthKey, 'Img'), depth: 1 }
-    ]
+    const targetDirs = this.buildSessionMonthImageDatDirs(accountDir, sessionDir, monthKey)
 
     for (const target of targetDirs) {
       if (budget.remaining <= 0) break
@@ -1050,6 +1158,47 @@ export class ImageDecryptService {
     }
 
     return Array.from(candidates)
+  }
+
+  private collectDatCandidatesFromSessionMonthByName(
+    accountDir: string,
+    imageDatName: string,
+    sessionId?: string,
+    createTime?: number
+  ): string[] {
+    const normalizedSessionId = String(sessionId || '').trim()
+    const monthKey = this.resolveYearMonthFromCreateTime(createTime)
+    if (!normalizedSessionId || !monthKey) return []
+
+    const sessionDir = this.resolveSessionDirForStorage(normalizedSessionId)
+    if (!sessionDir) return []
+
+    const targetNames = this.buildDatFileNameCandidates(imageDatName)
+    if (targetNames.length === 0) return []
+
+    const candidates = new Set<string>()
+    const budget = { remaining: 240 }
+    const targetDirs = this.buildSessionMonthImageDatDirs(accountDir, sessionDir, monthKey)
+    for (const target of targetDirs) {
+      if (budget.remaining <= 0) break
+      this.scanDatCandidatesUnderRootByNames(target.dir, targetNames, target.depth, candidates, budget)
+    }
+
+    return Array.from(candidates)
+  }
+
+  private buildSessionMonthImageDatDirs(accountDir: string, sessionDir: string, monthKey: string): Array<{ dir: string; depth: number }> {
+    return [
+      // 1) accountDir/msg/attach/{sessionMd5}/{yyyy-MM}/Img
+      { dir: join(accountDir, 'msg', 'attach', sessionDir, monthKey, 'Img'), depth: 1 },
+      // 2) WeChat 4.x message cache variants. Recalled images often only remain here.
+      { dir: join(accountDir, 'cache', monthKey, 'Message', sessionDir, 'Bubble'), depth: 1 },
+      { dir: join(accountDir, 'cache', monthKey, 'Message', sessionDir, 'ImageTemp'), depth: 1 },
+      { dir: join(accountDir, 'cache', monthKey, 'Message', sessionDir, 'Thumb'), depth: 1 },
+      { dir: join(accountDir, 'cache', monthKey, 'Message', sessionDir, 'Img'), depth: 1 },
+      // 3) Temporary message image cache used by recent macOS WeChat builds.
+      { dir: join(accountDir, 'temp', sessionDir, monthKey, 'Img'), depth: 1 }
+    ]
   }
 
   private resolveSessionDirForStorage(sessionId: string): string {
@@ -1089,6 +1238,82 @@ export class ImageDecryptService {
         const name = String(entry.name || '')
         if (!this.isHardlinkCandidateName(name, baseMd5)) continue
         const fullPath = join(current.dir, name)
+        if (existsSync(fullPath)) out.add(fullPath)
+      }
+
+      if (current.depth >= maxDepth) continue
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const name = String(entry.name || '')
+        if (!name || name === '.' || name === '..') continue
+        if (name.startsWith('.')) continue
+        stack.push({ dir: join(current.dir, name), depth: current.depth + 1 })
+      }
+    }
+  }
+
+  private buildDatFileNameCandidates(imageDatName: string): string[] {
+    let raw = String(imageDatName || '').trim().toLowerCase()
+    if (!raw) return []
+    raw = raw.replace(/&amp;/g, '&')
+    try {
+      if (raw.includes('%')) raw = decodeURIComponent(raw)
+    } catch { }
+    raw = raw.split(/[?#]/, 1)[0]
+    raw = basename(raw.replace(/\\/g, '/')).trim()
+    if (!/^[a-z0-9._-]{3,180}$/i.test(raw)) return []
+
+    const rawStem = raw.endsWith('.dat') ? raw.slice(0, -4) : raw
+    const normalizedStem = this.normalizeDatBase(rawStem)
+    const stems = new Set<string>([rawStem])
+    if (normalizedStem && normalizedStem !== rawStem) stems.add(normalizedStem)
+
+    const names = new Set<string>()
+    for (const stem of stems) {
+      const cleanStem = stem.trim().toLowerCase()
+      if (!cleanStem) continue
+      names.add(`${cleanStem}.dat`)
+      const alreadyVariant = /(?:[._](?:t|thumb|h|hd|b|w|c))$/i.test(cleanStem)
+      if (alreadyVariant) continue
+      names.add(`${cleanStem}_h.dat`)
+      names.add(`${cleanStem}_hd.dat`)
+      names.add(`${cleanStem}_b.dat`)
+      names.add(`${cleanStem}_t.dat`)
+      names.add(`${cleanStem}.t.dat`)
+    }
+    return Array.from(names)
+  }
+
+  private scanDatCandidatesUnderRootByNames(
+    rootDir: string,
+    fileNames: string[],
+    maxDepth: number,
+    out: Set<string>,
+    budget: { remaining: number }
+  ): void {
+    if (!rootDir || maxDepth < 0 || budget.remaining <= 0) return
+    if (!existsSync(rootDir) || !this.isDirectory(rootDir)) return
+    const targetNames = new Set(fileNames.map((name) => String(name || '').trim().toLowerCase()).filter(Boolean))
+    if (targetNames.size === 0) return
+
+    const stack: Array<{ dir: string; depth: number }> = [{ dir: rootDir, depth: 0 }]
+    while (stack.length > 0 && budget.remaining > 0) {
+      const current = stack.pop()
+      if (!current) break
+      budget.remaining -= 1
+
+      let entries: Array<{ name: string; isFile: () => boolean; isDirectory: () => boolean }>
+      try {
+        entries = readdirSync(current.dir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+
+      for (const entry of entries) {
+        if (!entry.isFile()) continue
+        const name = String(entry.name || '').trim().toLowerCase()
+        if (!targetNames.has(name)) continue
+        const fullPath = join(current.dir, entry.name)
         if (existsSync(fullPath)) out.add(fullPath)
       }
 
@@ -1168,9 +1393,6 @@ export class ImageDecryptService {
     const normalizedPath = String(fullPath || '').trim()
     const normalizedFileName = String(fileName || '').trim().toLowerCase()
     if (!normalizedPath || !normalizedFileName) return normalizedPath
-    if (!normalizedFileName.endsWith('.dat')) return normalizedPath
-    const normalizedBase = this.normalizeDatBase(normalizedFileName.slice(0, -4))
-    if (!this.looksLikeMd5(normalizedBase)) return ''
 
     // 最新策略：只要 hardlink 有记录，始终直接使用其记录路径（包括无后缀 DAT）。
     return normalizedPath
@@ -1191,15 +1413,6 @@ export class ImageDecryptService {
       const fileName = String(resolveResult.data.file_name || '').trim()
       const fullPath = String(resolveResult.data.full_path || '').trim()
       if (!fileName || !fullPath) return null
-
-      const lowerFileName = String(fileName).toLowerCase()
-      if (lowerFileName.endsWith('.dat')) {
-        const normalizedBase = this.normalizeDatBase(lowerFileName.slice(0, -4))
-        if (!this.looksLikeMd5(normalizedBase)) {
-          this.logInfo('[ImageDecrypt] hardlink fileName rejected', { fileName })
-          return null
-        }
-      }
 
       const selectedPath = this.normalizeHardlinkDatPathByFileName(fullPath, fileName)
       if (existsSync(selectedPath)) {
@@ -2094,6 +2307,13 @@ export class ImageDecryptService {
     )
   }
 
+  private isBubbleDatPath(datPath: string): boolean {
+    const name = basename(String(datPath || '')).toLowerCase()
+    if (!name.endsWith('.dat')) return false
+    const stem = name.slice(0, -4)
+    return stem.endsWith('_b') || stem.endsWith('.b')
+  }
+
   private isTVariantDat(datPath: string): boolean {
     const name = basename(String(datPath || '')).toLowerCase()
     return this.isThumbnailDat(name)
@@ -2109,6 +2329,7 @@ export class ImageDecryptService {
   private getDatTier(datPath: string, baseMd5: string): number {
     if (this.isHdDatPath(datPath)) return 3
     if (this.isBaseDatPath(datPath, baseMd5)) return 2
+    if (this.isBubbleDatPath(datPath)) return 1
     if (this.isTVariantDat(datPath)) return 1
     return 0
   }

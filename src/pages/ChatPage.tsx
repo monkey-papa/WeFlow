@@ -9852,6 +9852,8 @@ function MessageBubble({
       setImageError(false)
     }
     try {
+      let primaryError: string | undefined
+      let primaryFailureKind: SharedImageDecryptResult['failureKind']
       if (message.imageMd5 || message.imageDatName) {
         const sharedDecryptKey = `${session.username}:${imageCacheKey}:${forceUpdate ? 'force' : 'normal'}`
         const result = await getSharedImageDecryptTask(sharedDecryptKey, async () => {
@@ -9884,10 +9886,14 @@ function MessageBubble({
           setImageHasUpdate(false)
           if (result.liveVideoPath) setImageLiveVideoPath(result.liveVideoPath)
           return { ...result, localPath: renderPath }
-        } else if (!silent && result.error) {
-          setImageError(true)
-          setImageErrorReason(result.error)
-          setImageFailureKind(result.failureKind)
+        } else {
+          primaryError = result.error
+          primaryFailureKind = result.failureKind
+          if (!silent && result.error) {
+            setImageError(true)
+            setImageErrorReason(result.error)
+            setImageFailureKind(result.failureKind)
+          }
         }
       }
 
@@ -9906,8 +9912,8 @@ function MessageBubble({
       }
       if (!silent) {
         setImageError(true)
-        setImageErrorReason('图片数据获取失败')
-        setImageFailureKind('not_found')
+        setImageErrorReason(fallback.error || primaryError || '图片数据获取失败')
+        setImageFailureKind(primaryFailureKind || 'not_found')
       }
     } catch (e) {
       if (!silent) {

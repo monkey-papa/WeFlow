@@ -5271,7 +5271,7 @@ class ChatService {
         aesKey = imageInfo.aesKey
         encrypVer = imageInfo.encrypVer
         cdnThumbUrl = imageInfo.cdnThumbUrl
-        imageDatName = this.parseImageDatNameFromRow(row)
+        imageDatName = this.parseImageDatNameFromRow(row, content) || imageInfo.imageDatName
         // 解析图片消息中的引用信息
         const quoteInfo = this.parseMediaQuoteMessage(content, sessionId)
         if (quoteInfo.content) quotedContent = quoteInfo.content
@@ -5715,18 +5715,24 @@ class ChatService {
   /**
    * 解析图片信息
    */
-  private parseImageInfo(content: string): { md5?: string; aesKey?: string; encrypVer?: number; cdnThumbUrl?: string } {
+  private parseImageInfo(content: string): { md5?: string; imageDatName?: string; aesKey?: string; encrypVer?: number; cdnThumbUrl?: string } {
     try {
-      const md5 =
-        this.extractXmlValue(content, 'md5') ||
-        this.extractXmlAttribute(content, 'img', 'md5') ||
-        undefined
-      const aesKey = this.extractXmlAttribute(content, 'img', 'aeskey') || undefined
-      const encrypVerStr = this.extractXmlAttribute(content, 'img', 'encrypver') || undefined
-      const cdnThumbUrl = this.extractXmlAttribute(content, 'img', 'cdnthumburl') || undefined
+      const normalizedContent = this.decodeHtmlEntities(content || '')
+      const imageDatName = this.extractImageDatNameFromContent(normalizedContent)
+      const md5 = this.normalizeImageMd5Token(
+        this.extractXmlValue(normalizedContent, 'md5') ||
+        this.extractXmlAttribute(normalizedContent, 'img', 'md5') ||
+        this.extractXmlValue(normalizedContent, 'fullmd5') ||
+        this.extractXmlAttribute(normalizedContent, 'img', 'fullmd5') ||
+        imageDatName
+      )
+      const aesKey = this.extractXmlAttribute(normalizedContent, 'img', 'aeskey') || undefined
+      const encrypVerStr = this.extractXmlAttribute(normalizedContent, 'img', 'encrypver') || undefined
+      const cdnThumbUrl = this.extractXmlAttribute(normalizedContent, 'img', 'cdnthumburl') || undefined
 
       return {
         md5,
+        imageDatName,
         aesKey,
         encrypVer: encrypVerStr ? parseInt(encrypVerStr, 10) : undefined,
         cdnThumbUrl
@@ -5734,6 +5740,55 @@ class ChatService {
     } catch {
       return {}
     }
+  }
+
+  private normalizeImageMd5Token(value: unknown): string | undefined {
+    const token = this.normalizeImageDatNameToken(value)
+    return token && /^[a-f0-9]{32}$/i.test(token) ? token : undefined
+  }
+
+  private normalizeImageDatNameToken(value: unknown): string | undefined {
+    let text = String(value ?? '').trim()
+    if (!text) return undefined
+    text = text.replace(/&amp;/g, '&')
+    try {
+      if (text.includes('%')) text = decodeURIComponent(text)
+    } catch { }
+
+    const datFile = /([^/\\\s<>"']+?\.dat)(?:[?#&\s<>"']|$)/i.exec(text)
+    if (datFile?.[1]) return datFile[1].replace(/\.dat$/i, '').toLowerCase()
+
+    const datLike = /([0-9a-fA-F]{8,})(?:\.t)?\.dat/i.exec(text)
+    if (datLike?.[1]) return datLike[1].toLowerCase()
+    const base = text
+      .split(/[?#]/, 1)[0]
+      .replace(/^.*[\\/]/, '')
+      .replace(/\.(?:t\.)?dat$/i, '')
+      .trim()
+    if (!base) return undefined
+    const cdnToken = base.includes('_') ? base.split('_')[0] : base
+    const exact = /^([a-fA-F0-9]{16,64})$/.exec(cdnToken)
+    if (exact?.[1]) return exact[1].toLowerCase()
+    const preferred32 = /([a-fA-F0-9]{32})(?![a-fA-F0-9])/i.exec(cdnToken)
+    if (preferred32?.[1]) return preferred32[1].toLowerCase()
+    const fallback = /([a-fA-F0-9]{16,64})(?![a-fA-F0-9])/i.exec(cdnToken)
+    return fallback?.[1]?.toLowerCase()
+  }
+
+  private extractImageDatNameFromContent(content: string): string | undefined {
+    if (!content) return undefined
+    const candidate =
+      this.extractXmlValue(content, 'imgname') ||
+      this.extractXmlValue(content, 'cdnmidimgurl') ||
+      this.extractXmlValue(content, 'cdnbigimgurl') ||
+      this.extractXmlValue(content, 'cdnthumburl') ||
+      this.extractXmlValue(content, 'thumburl') ||
+      this.extractXmlAttribute(content, 'img', 'imgname') ||
+      this.extractXmlAttribute(content, 'img', 'cdnmidimgurl') ||
+      this.extractXmlAttribute(content, 'img', 'cdnbigimgurl') ||
+      this.extractXmlAttribute(content, 'img', 'cdnthumburl') ||
+      this.extractXmlAttribute(content, 'img', 'thumburl')
+    return this.normalizeImageDatNameToken(candidate)
   }
 
   /**
@@ -5823,7 +5878,34 @@ class ChatService {
     }
   }
 
-  private parseImageDatNameFromRow(row: Record<string, any>): string | undefined {
+  private extractImageDatNameFromPackedRaw(raw: unknown): string | undefined {
+    const buffer = this.decodePackedInfo(raw)
+    if (!buffer || buffer.length === 0) return undefined
+    const printable: number[] = []
+    for (const byte of buffer) {
+      if (byte >= 0x20 && byte <= 0x7e) {
+        printable.push(byte)
+      } else {
+        printable.push(0x20)
+      }
+    }
+    const text = Buffer.from(printable).toString('utf-8')
+    return this.normalizeImageDatNameToken(text)
+  }
+
+  private parseImageDatNameFromRow(row: Record<string, any>, content?: string): string | undefined {
+    const byColumn = this.normalizeImageDatNameToken(this.getRowField(row, [
+      'image_path',
+      'imagePath',
+      'image_dat_name',
+      'imageDatName',
+      'img_path',
+      'imgPath',
+      'img_name',
+      'imgName'
+    ]))
+    if (byColumn) return byColumn
+
     const packed = this.getRowField(row, [
       'packed_info_data',
       'packedInfoData',
@@ -5838,21 +5920,10 @@ class ChatService {
       'Reserved0',
       'WCDB_CT_Reserved0'
     ])
-    const buffer = this.decodePackedInfo(packed)
-    if (!buffer || buffer.length === 0) return undefined
-    const printable: number[] = []
-    for (const byte of buffer) {
-      if (byte >= 0x20 && byte <= 0x7e) {
-        printable.push(byte)
-      } else {
-        printable.push(0x20)
-      }
-    }
-    const text = Buffer.from(printable).toString('utf-8')
-    const match = /([0-9a-fA-F]{8,})(?:\.t)?\.dat/.exec(text)
-    if (match?.[1]) return match[1].toLowerCase()
-    const hexMatch = /([0-9a-fA-F]{16,})/.exec(text)
-    return hexMatch?.[1]?.toLowerCase()
+    const byPacked = this.extractImageDatNameFromPackedRaw(packed)
+    if (byPacked) return byPacked
+
+    return this.extractImageDatNameFromContent(content || '')
   }
 
   private parseVideoFileNameFromRow(row: Record<string, any>, content?: string): string | undefined {
@@ -8429,7 +8500,7 @@ class ChatService {
       const msg = msgResult.message
       const rawImageInfo = msg.rawContent ? this.parseImageInfo(msg.rawContent) : {}
       const imageMd5 = msg.imageMd5 || rawImageInfo.md5
-      const imageDatName = msg.imageDatName
+      const imageDatName = msg.imageDatName || rawImageInfo.imageDatName
 
       if (!imageMd5 && !imageDatName) {
         return { success: false, error: '图片缺少 md5/datName，无法定位原文件' }
@@ -8447,6 +8518,15 @@ class ChatService {
       })
 
       if (!result.success || !result.localPath) {
+        console.warn('[ChatService] getImageData decrypt failed', {
+          sessionId,
+          localId,
+          imageMd5,
+          imageDatName,
+          createTime: msg.createTime,
+          error: result.error,
+          failureKind: result.failureKind
+        })
         return { success: false, error: result.error || '图片解密失败' }
       }
 
@@ -11862,7 +11942,8 @@ class ChatService {
     if (msg.localType === 3) { // Image
       const imgInfo = this.parseImageInfo(rawContent)
       Object.assign(msg, imgInfo)
-      msg.imageDatName = this.parseImageDatNameFromRow(row)
+      msg.imageMd5 = imgInfo.md5
+      msg.imageDatName = this.parseImageDatNameFromRow(row, rawContent) || imgInfo.imageDatName
     } else if (msg.localType === 43) { // Video
       msg.videoMd5 = this.parseVideoFileNameFromRow(row, rawContent)
     } else if (msg.localType === 47) { // Emoji

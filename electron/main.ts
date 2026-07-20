@@ -839,21 +839,29 @@ const canKeepMainWindowInBackground = (): boolean => {
   return getCloseRestoreMethod() !== null
 }
 
-const getPlatformIconName = (): string => {
-  if (process.platform === 'linux') return 'icon.png'
-  if (process.platform === 'darwin') return 'icon.icns'
-  return 'icon.ico'
+const getRuntimeIconName = (): string => {
+  if (process.platform === 'win32') return 'icon.ico'
+  return 'icon.png'
 }
 
 const resolveAppIconPath = (): string => {
-  const iconName = getPlatformIconName()
+  const iconName = getRuntimeIconName()
   if (!process.env.VITE_DEV_SERVER_URL) {
     return join(process.resourcesPath, iconName)
   }
-  if (process.platform === 'darwin') {
-    return join(__dirname, '../resources/icons/macos/icon.icns')
-  }
   return join(__dirname, `../public/${iconName}`)
+}
+
+const applyAppDockIcon = (): void => {
+  if (process.platform !== 'darwin' || !app.dock) return
+  try {
+    const iconPath = resolveAppIconPath()
+    if (!existsSync(iconPath)) return
+    const icon = nativeImage.createFromPath(iconPath)
+    if (!icon.isEmpty()) app.dock.setIcon(icon)
+  } catch (error) {
+    console.warn('[App] Failed to set dock icon:', error)
+  }
 }
 
 const requestMainWindowCloseConfirmation = (win: BrowserWindow): void => {
@@ -978,12 +986,7 @@ function createAgreementWindow() {
     return agreementWindow
   }
 
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : (process.platform === 'darwin' 
-        ? join(process.resourcesPath, 'icon.icns')
-        : join(process.resourcesPath, 'icon.ico'))
+  const iconPath = resolveAppIconPath()
 
   const isDark = nativeTheme.shouldUseDarkColors
 
@@ -1033,11 +1036,7 @@ function createSplashWindow(): BrowserWindow {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const splashThemeId = configService?.get('themeId') || 'cloud-dancer'
   const splashThemeMode = configService?.get('theme') || 'system'
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : (process.platform === 'darwin' 
-        ? join(process.resourcesPath, 'icon.icns')
-        : join(process.resourcesPath, 'icon.ico'))
+  const iconPath = resolveAppIconPath()
 
   splashWindow = new BrowserWindow({
     width: 800,
@@ -1122,12 +1121,7 @@ function createOnboardingWindow(mode: 'default' | 'add-account' = 'default') {
     return onboardingWindow
   }
 
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : (process.platform === 'darwin' 
-        ? join(process.resourcesPath, 'icon.icns')
-        : join(process.resourcesPath, 'icon.ico'))
+  const iconPath = resolveAppIconPath()
 
   onboardingWindow = new BrowserWindow({
     width: 960,
@@ -1170,12 +1164,7 @@ function createOnboardingWindow(mode: 'default' | 'add-account' = 'default') {
  * 窗口大小会根据视频比例自动调整
  */
 function createVideoPlayerWindow(videoPath: string, videoWidth?: number, videoHeight?: number) {
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : (process.platform === 'darwin' 
-        ? join(process.resourcesPath, 'icon.icns')
-        : join(process.resourcesPath, 'icon.ico'))
+  const iconPath = resolveAppIconPath()
 
   // 获取屏幕尺寸
   const { screen } = require('electron')
@@ -1270,12 +1259,7 @@ function createVideoPlayerWindow(videoPath: string, videoWidth?: number, videoHe
  * 创建独立的图片查看窗口
  */
 function createImageViewerWindow(imagePath: string, liveVideoPath?: string) {
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : (process.platform === 'darwin' 
-        ? join(process.resourcesPath, 'icon.icns')
-        : join(process.resourcesPath, 'icon.ico'))
+  const iconPath = resolveAppIconPath()
 
   const win = new BrowserWindow({
     width: 900,
@@ -1342,12 +1326,7 @@ function createChatHistoryPayloadWindow(payloadId: string) {
 }
 
 function createChatHistoryRouteWindow(route: string) {
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : (process.platform === 'darwin' 
-        ? join(process.resourcesPath, 'icon.icns')
-        : join(process.resourcesPath, 'icon.ico'))
+  const iconPath = resolveAppIconPath()
 
   const win = new BrowserWindow({
     width: 600,
@@ -1434,12 +1413,7 @@ function createSessionChatWindow(sessionId: string, options?: OpenSessionChatWin
     return existing
   }
 
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : (process.platform === 'darwin' 
-        ? join(process.resourcesPath, 'icon.icns')
-        : join(process.resourcesPath, 'icon.ico'))
+  const iconPath = resolveAppIconPath()
 
   const isDark = nativeTheme.shouldUseDarkColors
 
@@ -2741,8 +2715,8 @@ function registerIpcHandlers() {
     return chatService.getImageData(sessionId, msgId)
   })
 
-  ipcMain.handle('chat:getVoiceData', async (_, sessionId: string, msgId: string, createTime?: number, serverId?: string | number) => {
-    return chatService.getVoiceData(sessionId, msgId, createTime, serverId)
+  ipcMain.handle('chat:getVoiceData', async (_, sessionId: string, msgId: string, createTime?: number, serverId?: string | number, senderWxid?: string | null) => {
+    return chatService.getVoiceData(sessionId, msgId, createTime, serverId, senderWxid || undefined)
   })
   ipcMain.handle('chat:getAllVoiceMessages', async (_, sessionId: string) => {
     return chatService.getAllVoiceMessages(sessionId)
@@ -2778,14 +2752,14 @@ function registerIpcHandlers() {
   }) => {
     return wcdbService.getMediaStream(options)
   })
-  ipcMain.handle('chat:resolveVoiceCache', async (_, sessionId: string, msgId: string) => {
-    return chatService.resolveVoiceCache(sessionId, msgId)
+  ipcMain.handle('chat:resolveVoiceCache', async (_, sessionId: string, msgId: string, createTime?: number) => {
+    return chatService.resolveVoiceCache(sessionId, msgId, createTime)
   })
 
-  ipcMain.handle('chat:getVoiceTranscript', async (event, sessionId: string, msgId: string, createTime?: number) => {
+  ipcMain.handle('chat:getVoiceTranscript', async (event, sessionId: string, msgId: string, createTime?: number, senderWxid?: string | null) => {
     return chatService.getVoiceTranscript(sessionId, msgId, createTime, (text) => {
       event.sender.send('chat:voiceTranscriptPartial', { sessionId, msgId, createTime, text })
-    })
+    }, senderWxid || undefined)
   })
 
   ipcMain.handle('chat:getMessage', async (_, sessionId: string, localId: number) => {
@@ -4244,6 +4218,7 @@ function checkForUpdatesOnStartup() {
 app.whenReady().then(async () => {
   // 先初始化配置，以便在启动早期判定是否需要静默启动
   configService = new ConfigService()
+  applyAppDockIcon()
   applyAutoUpdateChannel('startup')
   syncLaunchAtStartupPreference()
   const onboardingDone = configService.get('onboardingDone') === true

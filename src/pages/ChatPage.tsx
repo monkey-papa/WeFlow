@@ -6724,7 +6724,8 @@ function ChatPage(props: ChatPageProps) {
             session.username,
             String(msg.localId),
             msg.createTime,
-            msg.serverIdRaw || msg.serverId
+            msg.serverIdRaw || msg.serverId,
+            msg.senderUsername || undefined
           )
           return { success: Boolean(result.success && result.data) }
         }
@@ -10286,7 +10287,7 @@ function MessageBubble({
   // 消息加载时自动检测语音缓存
   useEffect(() => {
     if (!isVoice || voiceDataUrl) return
-    window.electronAPI.chat.resolveVoiceCache(session.username, String(message.localId))
+    window.electronAPI.chat.resolveVoiceCache(session.username, String(message.localId), message.createTime)
       .then((result: { success: boolean; hasCache: boolean; data?: string; error?: string }) => {
         if (result.success && result.hasCache && result.data) {
           const url = `data:audio/wav;base64,${result.data}`
@@ -10294,7 +10295,54 @@ function MessageBubble({
           setVoiceDataUrl(url)
         }
       })
-  }, [isVoice, message.localId, session.username, voiceCacheKey, voiceDataUrl])
+  }, [isVoice, message.createTime, message.localId, session.username, voiceCacheKey, voiceDataUrl])
+
+  // 语音消息进入列表后尽早解码落盘，避免撤回后微信媒体库被清空
+  useEffect(() => {
+    if (!isVoice || voiceDataUrl || voiceLoading) return
+    if (voiceAutoDecryptTriggered.current) return
+    const createTime = Math.max(0, Math.floor(Number(message.createTime || 0)))
+    const localId = Math.max(0, Math.floor(Number(message.localId || 0)))
+    if (!createTime || !localId) return
+
+    voiceAutoDecryptTriggered.current = true
+    void enqueueAutoMediaTask(async () => {
+      const nowSeconds = Math.floor(Date.now() / 1000)
+      const retryDelays = Math.abs(nowSeconds - createTime) <= 15 * 60 ? [0, 800, 2500] : [0]
+      for (const delayMs of retryDelays) {
+        if (delayMs > 0) {
+          await new Promise(resolve => window.setTimeout(resolve, delayMs))
+        }
+        const result = await window.electronAPI.chat.getVoiceData(
+          session.username,
+          String(message.localId),
+          message.createTime,
+          message.serverIdRaw || message.serverId,
+          message.senderUsername || undefined
+        )
+        if (result.success && result.data) {
+          const url = `data:audio/wav;base64,${result.data}`
+          voiceDataUrlCache.set(voiceCacheKey, url)
+          setVoiceDataUrl(url)
+          setVoiceError(false)
+          return
+        }
+      }
+    }).catch(() => {
+      voiceAutoDecryptTriggered.current = false
+    })
+  }, [
+    isVoice,
+    message.createTime,
+    message.localId,
+    message.senderUsername,
+    message.serverId,
+    message.serverIdRaw,
+    session.username,
+    voiceCacheKey,
+    voiceDataUrl,
+    voiceLoading
+  ])
 
   // 监听流式转写结果
   useEffect(() => {
@@ -10337,7 +10385,8 @@ function MessageBubble({
       const result = await window.electronAPI.chat.getVoiceTranscript(
           session.username,
           String(message.localId),
-          message.createTime
+          message.createTime,
+          message.senderUsername || undefined
       )
 
       if (result.success) {
@@ -11033,7 +11082,8 @@ function MessageBubble({
               session.username,
               String(message.localId),
               message.createTime,
-              message.serverIdRaw || message.serverId
+              message.serverIdRaw || message.serverId,
+              message.senderUsername || undefined
             )
             if (result.success && result.data) {
               const url = `data:audio/wav;base64,${result.data}`

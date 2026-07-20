@@ -673,7 +673,7 @@ export interface ElectronAPI {
       error?: string
     }>
     getImageData: (sessionId: string, msgId: string) => Promise<{ success: boolean; data?: string; error?: string }>
-    getVoiceData: (sessionId: string, msgId: string, createTime?: number, serverId?: string | number) => Promise<{ success: boolean; data?: string; error?: string }>
+    getVoiceData: (sessionId: string, msgId: string, createTime?: number, serverId?: string | number, senderWxid?: string | null) => Promise<{ success: boolean; data?: string; error?: string }>
     getAllVoiceMessages: (sessionId: string) => Promise<{ success: boolean; messages?: Message[]; error?: string }>
     getAllImageMessages: (sessionId: string) => Promise<{
       success: boolean
@@ -728,8 +728,8 @@ export interface ElectronAPI {
       nextOffset?: number
       error?: string
     }>
-    resolveVoiceCache: (sessionId: string, msgId: string) => Promise<{ success: boolean; hasCache: boolean; data?: string }>
-    getVoiceTranscript: (sessionId: string, msgId: string, createTime?: number) => Promise<{ success: boolean; transcript?: string; error?: string }>
+    resolveVoiceCache: (sessionId: string, msgId: string, createTime?: number) => Promise<{ success: boolean; hasCache: boolean; data?: string }>
+    getVoiceTranscript: (sessionId: string, msgId: string, createTime?: number, senderWxid?: string | null) => Promise<{ success: boolean; transcript?: string; error?: string }>
     onVoiceTranscriptPartial: (callback: (payload: { sessionId?: string; msgId: string; createTime?: number; text: string }) => void) => () => void
     getMessage: (sessionId: string, localId: number) => Promise<{ success: boolean; message?: Message; error?: string }>
     getMyFootprintStats: (

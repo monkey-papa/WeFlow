@@ -1782,7 +1782,8 @@ class HttpService {
           talker,
           String(msg.localId),
           msg.createTime || undefined,
-          this.getMessageServerId(msg) || undefined
+          this.getMessageServerId(msg) || undefined,
+          msg.senderUsername || undefined
         )
         if (result.success && result.data) {
           const fileName = `voice_${msg.localId}.wav`

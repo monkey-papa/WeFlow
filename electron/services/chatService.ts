@@ -364,6 +364,9 @@ class ChatService {
   private voiceWavCache: LRUCache<string, Buffer>
   private voiceTranscriptCache: LRUCache<string, string>
   private voiceTranscriptPending = new Map<string, Promise<{ success: boolean; transcript?: string; error?: string }>>()
+  private voicePreloadInFlight = new Set<string>()
+  private voicePreloadMonitorTimer: ReturnType<typeof setTimeout> | null = null
+  private voicePreloadMonitorTableNames = new Set<string>()
   private transcriptCacheLoaded = false
   private transcriptCacheDirty = false
   private transcriptFlushTimer: ReturnType<typeof setTimeout> | null = null
@@ -371,6 +374,11 @@ class ChatService {
   private mediaDbsCacheTime = 0
   private readonly mediaDbsCacheTtl = 300000 // 5分钟
   private readonly voiceWavCacheMaxEntries = 50
+  private readonly voicePreloadRetryDelaysMs = [800, 2500, 7000]
+  private readonly voicePreloadMonitorDebounceMs = 150
+  private readonly voicePreloadMonitorRecentSeconds = 120
+  private readonly voicePreloadMonitorFetchLimit = 80
+  private readonly voicePreloadMonitorMaxSessions = 8
   // 缓存 media.db 的表结构信息
   private mediaDbSchemaCache = new Map<string, {
     voiceTable: string
@@ -613,6 +621,7 @@ class ChatService {
     // 这种方式更高效，且不占用 JS 线程，并能直接监听 session/message 目录变更
     wcdbService.setMonitor((type, json) => {
       this.handleSessionStatsMonitorChange(type, json)
+      this.handleVoicePreloadMonitorChange(type, json)
       for (const listener of this.dbMonitorListeners) {
         try {
           listener(type, json)
@@ -628,6 +637,114 @@ class ChatService {
         }
       })
     })
+  }
+
+  private handleVoicePreloadMonitorChange(_type: string, json: string): void {
+    const payload = this.parseMonitorPayload(json)
+    const tableNames = this.collectMonitorMessageTableNames(payload)
+    if (tableNames.length === 0) return
+
+    for (const tableName of tableNames) {
+      this.voicePreloadMonitorTableNames.add(tableName)
+    }
+
+    if (this.voicePreloadMonitorTimer) {
+      clearTimeout(this.voicePreloadMonitorTimer)
+    }
+    this.voicePreloadMonitorTimer = setTimeout(() => {
+      this.voicePreloadMonitorTimer = null
+      void this.flushVoicePreloadMonitorChanges()
+    }, this.voicePreloadMonitorDebounceMs)
+  }
+
+  private parseMonitorPayload(json: string): Record<string, unknown> | null {
+    try {
+      const parsed = JSON.parse(String(json || ''))
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : null
+    } catch {
+      return null
+    }
+  }
+
+  private collectMonitorMessageTableNames(payload: Record<string, unknown> | null): string[] {
+    const tableNames = new Set<string>()
+    const visit = (value: unknown, keyHint = '') => {
+      if (value === null || value === undefined) return
+      if (typeof value === 'string') {
+        const trimmed = value.trim()
+        if (!trimmed) return
+        const key = keyHint.toLowerCase()
+        if (key.includes('table') && this.isMonitorMessageTableName(trimmed)) {
+          tableNames.add(trimmed)
+          return
+        }
+        for (const match of trimmed.matchAll(/\b(?:msg|message)_[a-z0-9_]+/gi)) {
+          const tableName = String(match[0] || '').trim()
+          if (tableName && this.isMonitorMessageTableName(tableName)) tableNames.add(tableName)
+        }
+        return
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item, keyHint)
+        return
+      }
+      if (typeof value !== 'object') return
+
+      for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+        visit(nested, key)
+      }
+    }
+
+    visit(payload)
+    return Array.from(tableNames)
+  }
+
+  private isMonitorMessageTableName(tableName: string): boolean {
+    const normalized = String(tableName || '').trim().toLowerCase()
+    if (!normalized) return false
+    return normalized === 'message' ||
+      normalized === 'msg' ||
+      normalized.startsWith('message_') ||
+      normalized.startsWith('msg_') ||
+      normalized.includes('message')
+  }
+
+  private async flushVoicePreloadMonitorChanges(): Promise<void> {
+    const tableNames = Array.from(this.voicePreloadMonitorTableNames)
+    this.voicePreloadMonitorTableNames.clear()
+    if (tableNames.length === 0) return
+
+    try {
+      const sessionsResult = await this.getSessions()
+      if (!sessionsResult.success || !Array.isArray(sessionsResult.sessions)) return
+
+      const sessionIds = sessionsResult.sessions
+        .map(session => String(session?.username || '').trim())
+        .filter(Boolean)
+      if (sessionIds.length === 0) return
+
+      const hashLookup = this.buildSessionHashLookup(sessionIds)
+      const targetSessionIds = new Set<string>()
+      for (const tableName of tableNames) {
+        const sessionId = this.matchSessionIdByTableName(tableName, hashLookup)
+        if (sessionId) targetSessionIds.add(sessionId)
+      }
+
+      const targets = Array.from(targetSessionIds).slice(0, this.voicePreloadMonitorMaxSessions)
+      if (targets.length === 0) return
+
+      const since = Math.max(0, Math.floor(Date.now() / 1000) - this.voicePreloadMonitorRecentSeconds)
+      await this.forEachWithConcurrency(targets, 2, async (sessionId) => {
+        const result = await this.getNewMessages(sessionId, since, this.voicePreloadMonitorFetchLimit)
+        if (result.success && Array.isArray(result.messages)) {
+          this.scheduleVoicePreloadForMessages(sessionId, result.messages, 'monitor')
+        }
+      })
+    } catch (error) {
+      console.warn('[VoicePreload] 监听预缓存失败:', error)
+    }
   }
 
   /**
@@ -723,6 +840,12 @@ class ChatService {
 
   close(): void {
     try {
+      if (this.voicePreloadMonitorTimer) {
+        clearTimeout(this.voicePreloadMonitorTimer)
+        this.voicePreloadMonitorTimer = null
+      }
+      this.voicePreloadMonitorTableNames.clear()
+      this.voicePreloadInFlight.clear()
       for (const state of this.messageCursors.values()) {
         wcdbService.closeMessageCursor(state.cursor)
       }
@@ -2430,6 +2553,7 @@ class ChatService {
       console.log(
         `[ChatService] getMessages session=${sessionId} rawRowsConsumed=${rawRowsConsumed} visibleMessagesReturned=${filtered.length} filteredOut=${collected.filteredOut || 0} nextOffset=${state.fetched} hasMore=${hasMore}`
       )
+      this.scheduleVoicePreloadForMessages(sessionId, filtered, 'getMessages')
       return { success: true, messages: filtered, hasMore, nextOffset: state.fetched }
     } catch (e) {
       console.error('ChatService: 获取消息失败:', e)
@@ -2568,6 +2692,7 @@ class ChatService {
       await this.resolveQuotedMessages(normalized, sessionId)
     }
 
+    this.scheduleVoicePreloadForMessages(sessionId, normalized, 'offset-stable')
     return {
       success: true,
       messages: normalized,
@@ -2653,6 +2778,7 @@ class ChatService {
       await this.resolveQuotedMessages(normalized, sessionId)
     }
 
+    this.scheduleVoicePreloadForMessages(sessionId, normalized, 'cursor-stable')
     return {
       success: true,
       messages: normalized,
@@ -2819,6 +2945,7 @@ class ChatService {
         await Promise.allSettled(fixPromises)
       }
 
+      this.scheduleVoicePreloadForMessages(sessionId, normalized, 'getNewMessages')
       return { success: true, messages: normalized }
     } catch (e) {
       console.error('ChatService: 获取增量消息失败:', e)
@@ -7767,6 +7894,12 @@ class ChatService {
       this.voiceWavCache.clear()
       this.voiceTranscriptCache.clear()
       this.voiceTranscriptPending.clear()
+      this.voicePreloadInFlight.clear()
+      if (this.voicePreloadMonitorTimer) {
+        clearTimeout(this.voicePreloadMonitorTimer)
+        this.voicePreloadMonitorTimer = null
+      }
+      this.voicePreloadMonitorTableNames.clear()
     }
 
     if (includeMessages || includeContacts) {
@@ -8593,8 +8726,8 @@ class ChatService {
       const hasStrongInput = Number.isFinite(Number(msgCreateTime)) && Number(msgCreateTime) > 0
         && Boolean(this.normalizeUnsignedIntegerToken(serverId))
 
-      if (hasStrongInput) {
-        lookupPath.push('调用入参已具备强键(createTime+serverId)，跳过localId反查')
+      if (hasStrongInput && senderWxid) {
+        lookupPath.push('调用入参已具备强键(createTime+serverId+sender)，跳过localId反查')
       } else {
         const t1 = Date.now()
         const msgResult = await this.getMessageByLocalId(sessionId, localId)
@@ -8819,50 +8952,69 @@ class ChatService {
 
       for (const plan of plans) {
         lookupPath?.push(`尝试候选集[${plan.label}]=${JSON.stringify(plan.list)}`)
-        // 先走单条 native：svr_id 通过 int64 直传，避免 batch JSON 的大整数精度/解析差异
-        lookupPath?.push(`先尝试单条查询(${plan.label})`)
-        const single = await wcdbService.getVoiceData(
-          sessionId,
-          createTimeInt,
-          plan.list,
-          localIdInt,
-          svrIdToken
-        )
-        lookupPath?.push(`单条查询(${plan.label})结果: success=${single.success}, hasHex=${Boolean(single.hex)}`)
-        if (single.success && single.hex) {
-          const decoded = this.decodeVoiceBlob(single.hex)
-          if (decoded && decoded.length > 0) {
-            lookupPath?.push(`单条查询(${plan.label})解码成功`)
-            return decoded
-          }
-          lookupPath?.push(`单条查询(${plan.label})解码为空`)
+
+        const queryAttempts: Array<{ label: string; localId: number; svrId: string | number }> = []
+        const seenAttemptKeys = new Set<string>()
+        const addQueryAttempt = (label: string, localId: number, querySvrId: string | number) => {
+          const key = `${localId}|${String(querySvrId || 0)}`
+          if (seenAttemptKeys.has(key)) return
+          seenAttemptKeys.add(key)
+          queryAttempts.push({ label, localId, svrId: querySvrId || 0 })
+        }
+        addQueryAttempt('primary', localIdInt, svrIdToken)
+        if (this.normalizeUnsignedIntegerToken(svrIdToken)) {
+          // serverId 是 64 位整数，前端/JSON 链路一旦丢精度会导致命中空记录。
+          addQueryAttempt('without-svr', localIdInt, 0)
+          addQueryAttempt('without-local', 0, svrIdToken)
         }
 
-        const batchResult = await wcdbService.getVoiceDataBatch([{
-          session_id: sessionId,
-          create_time: createTimeInt,
-          local_id: localIdInt,
-          svr_id: svrIdToken,
-          candidates: plan.list
-        }])
-        lookupPath?.push(`批量查询(${plan.label})结果: success=${batchResult.success}, rows=${Array.isArray(batchResult.rows) ? batchResult.rows.length : 0}`)
-        if (!batchResult.success) {
-          lookupPath?.push(`批量查询(${plan.label})失败: ${batchResult.error || '无错误信息'}`)
-        }
-
-        if (batchResult.success && Array.isArray(batchResult.rows) && batchResult.rows.length > 0) {
-          const hex = String(batchResult.rows[0]?.hex || '').trim()
-          lookupPath?.push(`命中批量结果(${plan.label})[0], hexLen=${hex.length}`)
-          if (hex) {
-            const decoded = this.decodeVoiceBlob(hex)
+        for (const attempt of queryAttempts) {
+          const attemptLabel = `${plan.label}/${attempt.label}`
+          // 先走单条 native：svr_id 通过 int64 直传，避免 batch JSON 的大整数精度/解析差异
+          lookupPath?.push(`先尝试单条查询(${attemptLabel}) localId=${attempt.localId}, svrId=${attempt.svrId}`)
+          const single = await wcdbService.getVoiceData(
+            sessionId,
+            createTimeInt,
+            plan.list,
+            attempt.localId,
+            attempt.svrId
+          )
+          lookupPath?.push(`单条查询(${attemptLabel})结果: success=${single.success}, hasHex=${Boolean(single.hex)}`)
+          if (single.success && single.hex) {
+            const decoded = this.decodeVoiceBlob(single.hex)
             if (decoded && decoded.length > 0) {
-              lookupPath?.push(`批量结果(${plan.label})解码成功`)
+              lookupPath?.push(`单条查询(${attemptLabel})解码成功`)
               return decoded
             }
-            lookupPath?.push(`批量结果(${plan.label})解码为空`)
+            lookupPath?.push(`单条查询(${attemptLabel})解码为空`)
           }
-        } else {
-          lookupPath?.push(`批量结果(${plan.label})未命中`)
+
+          const batchResult = await wcdbService.getVoiceDataBatch([{
+            session_id: sessionId,
+            create_time: createTimeInt,
+            local_id: attempt.localId,
+            svr_id: attempt.svrId,
+            candidates: plan.list
+          }])
+          lookupPath?.push(`批量查询(${attemptLabel})结果: success=${batchResult.success}, rows=${Array.isArray(batchResult.rows) ? batchResult.rows.length : 0}`)
+          if (!batchResult.success) {
+            lookupPath?.push(`批量查询(${attemptLabel})失败: ${batchResult.error || '无错误信息'}`)
+          }
+
+          if (batchResult.success && Array.isArray(batchResult.rows) && batchResult.rows.length > 0) {
+            const hex = String(batchResult.rows[0]?.hex || '').trim()
+            lookupPath?.push(`命中批量结果(${attemptLabel})[0], hexLen=${hex.length}`)
+            if (hex) {
+              const decoded = this.decodeVoiceBlob(hex)
+              if (decoded && decoded.length > 0) {
+                lookupPath?.push(`批量结果(${attemptLabel})解码成功`)
+                return decoded
+              }
+              lookupPath?.push(`批量结果(${attemptLabel})解码为空`)
+            }
+          } else {
+            lookupPath?.push(`批量结果(${attemptLabel})未命中`)
+          }
         }
       }
 
@@ -8874,12 +9026,85 @@ class ChatService {
     }
   }
 
+  private scheduleVoicePreloadForMessages(sessionId: string, messages: Message[], reason: string = 'message-list'): void {
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId || !Array.isArray(messages) || messages.length === 0) return
+
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    const items: Array<{
+      cacheKey: string
+      localId: number
+      createTime: number
+      serverId?: number | string
+      serverIdRaw?: number | string
+      senderWxid?: string | null
+    }> = []
+
+    for (const message of messages) {
+      if (Number(message?.localType || 0) !== 34) continue
+      const localId = Math.max(0, Math.floor(Number(message.localId || 0)))
+      const createTime = Math.max(0, Math.floor(Number(message.createTime || 0)))
+      if (!localId || !createTime) continue
+
+      const cacheKey = this.getVoiceCacheKey(normalizedSessionId, String(localId), createTime)
+      if (this.voicePreloadInFlight.has(cacheKey)) continue
+      this.voicePreloadInFlight.add(cacheKey)
+
+      items.push({
+        cacheKey,
+        localId,
+        createTime,
+        serverId: message.serverId,
+        serverIdRaw: message.serverIdRaw,
+        senderWxid: message.senderUsername || undefined
+      })
+    }
+
+    if (items.length === 0) return
+
+    const hasRecentVoice = items.some(item => Math.abs(nowSeconds - item.createTime) <= 15 * 60)
+    const retryDelays = hasRecentVoice ? this.voicePreloadRetryDelaysMs : []
+
+    const run = async (attempt: number): Promise<void> => {
+      try {
+        const result = await this.preloadVoiceDataBatch(normalizedSessionId, items, {
+          chunkSize: 32,
+          decodeConcurrency: 2
+        })
+        const prepared = Math.max(0, Math.floor(Number(result.prepared || 0)))
+        if (prepared < items.length && attempt < retryDelays.length) {
+          const delayMs = retryDelays[attempt]
+          setTimeout(() => {
+            void run(attempt + 1)
+          }, delayMs)
+          return
+        }
+        if (prepared > 0 && process.env.WEFLOW_VOICE_TRACE === '1') {
+          console.info(`[VoicePreload] ${reason} prepared=${prepared}/${items.length}`)
+        }
+      } catch (error) {
+        if (process.env.WEFLOW_VOICE_TRACE === '1') {
+          console.warn(`[VoicePreload] ${reason} failed:`, error)
+        }
+      }
+
+      for (const item of items) {
+        this.voicePreloadInFlight.delete(item.cacheKey)
+      }
+    }
+
+    setTimeout(() => {
+      void run(0)
+    }, 0)
+  }
+
   async preloadVoiceDataBatch(
     sessionId: string,
     messages: Array<{
       localId?: number | string
       createTime?: number | string
       serverId?: number | string
+      serverIdRaw?: number | string
       senderWxid?: string | null
     }>,
     options?: { chunkSize?: number; decodeConcurrency?: number }
@@ -8895,7 +9120,7 @@ class ChatService {
       if (!Array.isArray(messages) || messages.length === 0) return { success: true, prepared: 0 }
 
       const myWxid = String(this.configService.getMyWxidCleaned() || '').trim()
-      const nowPrepared = new Set<string>()
+      const preparedKeys = new Set<string>()
       const pending: Array<{
         cacheKey: string
         request: { session_id: string; create_time: number; local_id: number; svr_id: string | number; candidates: string[] }
@@ -8907,11 +9132,13 @@ class ChatService {
         if (!localId || !createTime) continue
 
         const cacheKey = this.getVoiceCacheKey(normalizedSessionId, String(localId), createTime)
-        if (nowPrepared.has(cacheKey)) continue
-        nowPrepared.add(cacheKey)
+        if (preparedKeys.has(cacheKey)) continue
 
         const inMemory = this.voiceWavCache.get(cacheKey)
-        if (inMemory && inMemory.length > 0) continue
+        if (inMemory && inMemory.length > 0) {
+          preparedKeys.add(cacheKey)
+          continue
+        }
 
         const wavFilePath = join(this.getVoiceCacheDir(), `${cacheKey}.wav`)
         if (existsSync(wavFilePath)) {
@@ -8919,6 +9146,7 @@ class ChatService {
             const wavData = readFileSync(wavFilePath)
             if (wavData.length > 0) {
               this.cacheVoiceWav(cacheKey, wavData)
+              preparedKeys.add(cacheKey)
               continue
             }
           } catch {
@@ -8932,25 +9160,38 @@ class ChatService {
         if (!candidates.includes(normalizedSessionId)) candidates.push(normalizedSessionId)
         if (myWxid && !candidates.includes(myWxid)) candidates.push(myWxid)
 
-        pending.push({
-          cacheKey,
-          request: {
-            session_id: normalizedSessionId,
-            create_time: createTime,
-            local_id: localId,
-            svr_id: item?.serverId || 0,
-            candidates
-          }
-        })
+        const serverIdToken = this.normalizeUnsignedIntegerToken(item?.serverIdRaw ?? item?.serverId)
+        const queryServerId = serverIdToken || item?.serverIdRaw || item?.serverId || 0
+        const seenAttempts = new Set<string>()
+        const addAttempt = (attemptLocalId: number, attemptServerId: string | number) => {
+          const key = `${attemptLocalId}|${String(attemptServerId || 0)}`
+          if (seenAttempts.has(key)) return
+          seenAttempts.add(key)
+          pending.push({
+            cacheKey,
+            request: {
+              session_id: normalizedSessionId,
+              create_time: createTime,
+              local_id: attemptLocalId,
+              svr_id: attemptServerId || 0,
+              candidates
+            }
+          })
+        }
+
+        addAttempt(localId, queryServerId)
+        if (serverIdToken) {
+          addAttempt(localId, 0)
+          addAttempt(0, queryServerId)
+        }
       }
 
       if (pending.length === 0) {
-        return { success: true, prepared: nowPrepared.size }
+        return { success: true, prepared: preparedKeys.size }
       }
 
       const chunkSize = Math.max(8, Math.min(128, Math.floor(Number(options?.chunkSize || 48))))
       const decodeConcurrency = Math.max(1, Math.min(6, Math.floor(Number(options?.decodeConcurrency || 3))))
-      let prepared = nowPrepared.size - pending.length
 
       for (let i = 0; i < pending.length; i += chunkSize) {
         const chunk = pending.slice(i, i + chunkSize)
@@ -8967,14 +9208,18 @@ class ChatService {
           byIndex.set(idx, hex)
         }
 
-        const readyItems: Array<{ cacheKey: string; hex: string }> = []
+        const readyByCacheKey = new Map<string, string>()
         for (let rowIdx = 0; rowIdx < chunk.length; rowIdx += 1) {
           const hex = byIndex.get(rowIdx)
           if (!hex) continue
-          readyItems.push({ cacheKey: chunk[rowIdx].cacheKey, hex })
+          const cacheKey = chunk[rowIdx].cacheKey
+          if (preparedKeys.has(cacheKey) || readyByCacheKey.has(cacheKey)) continue
+          readyByCacheKey.set(cacheKey, hex)
         }
+        const readyItems = Array.from(readyByCacheKey.entries()).map(([cacheKey, hex]) => ({ cacheKey, hex }))
 
         await this.forEachWithConcurrency(readyItems, decodeConcurrency, async (item) => {
+          if (preparedKeys.has(item.cacheKey)) return
           const silkData = this.decodeVoiceBlob(item.hex)
           if (!silkData || silkData.length === 0) return
 
@@ -8983,31 +9228,46 @@ class ChatService {
 
           const wavData = this.createWavBuffer(pcmData, 24000)
           this.cacheVoiceWav(item.cacheKey, wavData)
-          this.cacheVoiceWavToFile(item.cacheKey, wavData)
-          prepared += 1
+          await this.cacheVoiceWavToFile(item.cacheKey, wavData)
+          preparedKeys.add(item.cacheKey)
         })
       }
 
-      return { success: true, prepared }
+      return { success: true, prepared: preparedKeys.size }
     } catch (e) {
       return { success: false, error: String(e) }
     }
   }
 
   /**
-   * 检查语音是否已有缓存（只检查内存，不查询数据库）
+   * 检查语音是否已有缓存（只查 WeFlow 自己的 WAV 缓存，不查询微信数据库）
    */
-  async resolveVoiceCache(sessionId: string, msgId: string): Promise<{ success: boolean; hasCache: boolean; data?: string }> {
+  async resolveVoiceCache(sessionId: string, msgId: string, createTime?: number): Promise<{ success: boolean; hasCache: boolean; data?: string }> {
     try {
-      // 直接用 msgId 生成 cacheKey，不查询数据库
-      // 注意：这里的 cacheKey 可能不准确（因为没有 createTime），但只是用来快速检查缓存
-      // 如果缓存未命中，用户点击时会重新用正确的 cacheKey 查询
-      const cacheKey = this.getVoiceCacheKey(sessionId, msgId)
+      const cacheKeys: string[] = []
+      const createTimeInt = Math.max(0, Math.floor(Number(createTime || 0)))
+      if (createTimeInt > 0) {
+        cacheKeys.push(this.getVoiceCacheKey(sessionId, msgId, createTimeInt))
+      }
+      cacheKeys.push(this.getVoiceCacheKey(sessionId, msgId))
 
-      // 检查内存缓存
-      const inMemory = this.voiceWavCache.get(cacheKey)
-      if (inMemory) {
-        return { success: true, hasCache: true, data: inMemory.toString('base64') }
+      for (const cacheKey of cacheKeys) {
+        const inMemory = this.voiceWavCache.get(cacheKey)
+        if (inMemory && inMemory.length > 0) {
+          return { success: true, hasCache: true, data: inMemory.toString('base64') }
+        }
+
+        const wavFilePath = join(this.getVoiceCacheDir(), `${cacheKey}.wav`)
+        if (!existsSync(wavFilePath)) continue
+        try {
+          const wavData = readFileSync(wavFilePath)
+          if (wavData.length > 0) {
+            this.cacheVoiceWav(cacheKey, wavData)
+            return { success: true, hasCache: true, data: wavData.toString('base64') }
+          }
+        } catch {
+          // ignore corrupted cache file
+        }
       }
 
       return { success: true, hasCache: false }

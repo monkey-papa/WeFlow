@@ -20,6 +20,14 @@ export function setNotificationNavigateHandler(
 let notificationWindow: BrowserWindow | null = null;
 let closeTimer: NodeJS.Timeout | null = null;
 
+function resolveNotificationIconPath() {
+  const iconName = process.platform === "win32" ? "icon.ico" : "icon.png";
+  if (process.env.VITE_DEV_SERVER_URL) {
+    return join(__dirname, `../../public/${iconName}`);
+  }
+  return join(process.resourcesPath, iconName);
+}
+
 export function destroyNotificationWindow() {
   if (closeTimer) {
     clearTimeout(closeTimer);
@@ -56,9 +64,7 @@ export function createNotificationWindow() {
   }
 
   const isDev = !!process.env.VITE_DEV_SERVER_URL;
-  const iconPath = isDev
-    ? join(__dirname, "../../public/icon.ico")
-    : join(process.resourcesPath, "icon.ico");
+  const iconPath = resolveNotificationIconPath();
 
   console.log("[NotificationWindow] Creating window...");
   const width = 344;

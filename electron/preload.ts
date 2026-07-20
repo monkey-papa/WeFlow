@@ -255,8 +255,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getGroupMyMessageCountHint: (chatroomId: string) =>
       ipcRenderer.invoke('chat:getGroupMyMessageCountHint', chatroomId),
     getImageData: (sessionId: string, msgId: string) => ipcRenderer.invoke('chat:getImageData', sessionId, msgId),
-    getVoiceData: (sessionId: string, msgId: string, createTime?: number, serverId?: string | number) =>
-      ipcRenderer.invoke('chat:getVoiceData', sessionId, msgId, createTime, serverId),
+    getVoiceData: (sessionId: string, msgId: string, createTime?: number, serverId?: string | number, senderWxid?: string | null) =>
+      ipcRenderer.invoke('chat:getVoiceData', sessionId, msgId, createTime, serverId, senderWxid),
     getAllVoiceMessages: (sessionId: string) => ipcRenderer.invoke('chat:getAllVoiceMessages', sessionId),
     getAllImageMessages: (sessionId: string) => ipcRenderer.invoke('chat:getAllImageMessages', sessionId),
     getMessageDates: (sessionId: string) => ipcRenderer.invoke('chat:getMessageDates', sessionId),
@@ -277,8 +277,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       limit?: number
       offset?: number
     }) => ipcRenderer.invoke('chat:getMediaStream', options),
-    resolveVoiceCache: (sessionId: string, msgId: string) => ipcRenderer.invoke('chat:resolveVoiceCache', sessionId, msgId),
-    getVoiceTranscript: (sessionId: string, msgId: string, createTime?: number) => ipcRenderer.invoke('chat:getVoiceTranscript', sessionId, msgId, createTime),
+    resolveVoiceCache: (sessionId: string, msgId: string, createTime?: number) => ipcRenderer.invoke('chat:resolveVoiceCache', sessionId, msgId, createTime),
+    getVoiceTranscript: (sessionId: string, msgId: string, createTime?: number, senderWxid?: string | null) => ipcRenderer.invoke('chat:getVoiceTranscript', sessionId, msgId, createTime, senderWxid),
     onVoiceTranscriptPartial: (callback: (payload: { sessionId?: string; msgId: string; createTime?: number; text: string }) => void) => {
       const listener = (_: any, payload: { sessionId?: string; msgId: string; createTime?: number; text: string }) => callback(payload)
       ipcRenderer.on('chat:voiceTranscriptPartial', listener)

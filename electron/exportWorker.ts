@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'worker_threads'
-import { runWeliveExport, type WeliveExportEvent } from './services/weliveBridge'
+import { runWeliveExport, type WeliveExportEvent, type WeliveExportResult } from './services/weliveBridge'
 
 interface ExportWorkerConfig {
   mode?: 'sessions' | 'single' | 'contacts'
@@ -153,6 +153,31 @@ const shouldUseWeliveEngine = () => {
   const env = String(process.env.WEFLOW_EXPORT_ENGINE || '').trim().toLowerCase()
   if (env === 'legacy') return false
   return true
+}
+
+// WeLive 引擎整体不可用的特征：构建过期、进程崩溃（Windows 0xC0000005）、可执行文件缺失。
+// 命中这些特征说明不是"某个会话导出失败"，而是整个引擎都跑不了，此时自动改用内置兼容引擎。
+const WELIVE_ENGINE_UNAVAILABLE_PATTERN =
+  /3221225477|0x?c0000005|-1073741819|this build has expired|未找到 WeLive 导出引擎|spawn .*ENOENT|spawn .*EACCES/i
+const WELIVE_BUILD_EXPIRED_PATTERN = /this build has expired/i
+const WELIVE_CRASH_PATTERN = /3221225477|0x?c0000005|-1073741819/i
+
+const collectWeliveFailureText = (result?: WeliveExportResult): string =>
+  [result?.error, result?.stderr, ...Object.values(result?.failedSessionErrors || {})]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .join('\n')
+
+export const isWeliveEngineUnavailable = (result?: WeliveExportResult): boolean => {
+  if (!result || result.success) return false
+  return WELIVE_ENGINE_UNAVAILABLE_PATTERN.test(collectWeliveFailureText(result))
+}
+
+export const describeWeliveUnavailableReason = (result?: WeliveExportResult): string => {
+  const text = collectWeliveFailureText(result)
+  if (WELIVE_BUILD_EXPIRED_PATTERN.test(text)) return '构建已过期'
+  if (WELIVE_CRASH_PATTERN.test(text)) return '异常退出'
+  return '不可用'
 }
 
 const normalizeImageXorKey = (value: unknown): string | number | undefined => {
@@ -455,18 +480,7 @@ async function runWeliveEngine() {
   }
 }
 
-async function run() {
-  if (shouldUseWeliveEngine()) {
-    const result = await runWeliveEngine()
-    flushProgress()
-    flushCreatedPaths()
-    parentPort?.postMessage({
-      type: 'export:result',
-      data: result
-    })
-    return
-  }
-
+async function runLegacyEngine(): Promise<any> {
   const [{ wcdbService }, { exportService }] = await Promise.all([
     import('./services/wcdbService'),
     import('./services/export')
@@ -532,12 +546,53 @@ async function run() {
     )
   }
 
+  return result
+}
+
+async function run() {
+  let weliveFallbackNotice = ''
+  let weliveFallbackReason = ''
+
+  if (shouldUseWeliveEngine()) {
+    const weliveResult = await runWeliveEngine()
+    if (!isWeliveEngineUnavailable(weliveResult)) {
+      flushProgress()
+      flushCreatedPaths()
+      parentPort?.postMessage({
+        type: 'export:result',
+        data: weliveResult
+      })
+      return
+    }
+
+    weliveFallbackReason = describeWeliveUnavailableReason(weliveResult)
+    weliveFallbackNotice = `WeLive 导出引擎${weliveFallbackReason}，正在切换内置兼容导出引擎`
+    console.warn(`[export-worker] ${weliveFallbackNotice}`)
+    flushCreatedPaths()
+    queueProgress({
+      current: 0,
+      total: 100,
+      currentSession: '',
+      phase: 'preparing',
+      phaseLabel: weliveFallbackNotice,
+      collectedMessages: 0
+    })
+    flushProgress()
+  }
+
+  const result = await runLegacyEngine()
+
   flushProgress()
   flushCreatedPaths()
 
   parentPort?.postMessage({
     type: 'export:result',
-    data: result
+    data: weliveFallbackReason && result && result.success === false
+      ? {
+          ...result,
+          error: `${String(result.error || '兼容导出引擎导出失败')}（已因 WeLive 导出引擎${weliveFallbackReason}改用内置兼容导出引擎）`
+        }
+      : result
   })
 }
 
